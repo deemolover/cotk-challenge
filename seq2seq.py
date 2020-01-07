@@ -23,6 +23,7 @@ class Seq2seq(BaseModel):
 		super().__init__(param, net, optimizerList, checkpoint_manager)
 
 		self.create_summary()
+		self.haslogged = False # for debugging
 
 	def create_summary(self):
 		args = self.param.args
@@ -62,6 +63,9 @@ class Seq2seq(BaseModel):
 
 	def get_next_batch(self, dm, key, restart=True):
 		data = dm.get_next_batch(key)
+		if self.haslogged == False:
+			print(data) # for debugging
+			self.haslogged = True
 		if data is None:
 			if restart:
 				dm.restart(key)

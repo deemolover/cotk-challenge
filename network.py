@@ -3,186 +3,202 @@ import logging
 
 import torch
 from torch import nn
+import numpy as np
+from transformer.Layers import EncoderLayer, DecoderLayer
 
 from utils import zeros, LongTensor,\
 			BaseNetwork, MyGRU, Storage, gumbel_max, flattenSequence, SingleAttnGRU, SequenceBatchNorm
+
+'''
+
+class Transformer(nn.Module):
+
+	def __init__(
+			self, n_src_vocab, n_trg_vocab, src_pad_idx, trg_pad_idx,
+			d_word_vec=512, d_model=512, d_inner=2048,
+			n_layers=6, n_head=8, d_k=64, d_v=64, dropout=0.1, n_position=200,
+			trg_emb_prj_weight_sharing=True, emb_src_trg_weight_sharing=True):
+'''
+
 
 # pylint: disable=W0221
 class Network(BaseNetwork):
 	def __init__(self, param):
 		super().__init__(param)
-
-		self.embLayer = EmbeddingLayer(param)
-		self.postEncoder = PostEncoder(param)
-		self.connectLayer = ConnectLayer(param)
-		self.genNetwork = GenNetwork(param)
-
+        
+		n_vocab = param.volatile.dm.all_vocab_size
+		self.transformer = Transformer(n_vocab, n_vocab, 0, 0)
+	
 	def forward(self, incoming):
 		incoming.result = Storage()
-
-		self.embLayer.forward(incoming)
-		self.postEncoder.forward(incoming)
-		self.connectLayer.forward(incoming)
-		self.genNetwork.forward(incoming)
-
+		self.transformer.forward(incoming)
 		incoming.result.loss = incoming.result.word_loss
 
 		if torch.isnan(incoming.result.loss).detach().cpu().numpy() > 0:
 			logging.info("Nan detected")
 			logging.info(incoming.result)
 			raise FloatingPointError("Nan detected")
-
+	
 	def detail_forward(self, incoming):
 		incoming.result = Storage()
+		self.transformer.forward(incoming)
 
-		self.embLayer.forward(incoming)
-		self.postEncoder.forward(incoming)
-		self.connectLayer.forward(incoming)
-		self.genNetwork.detail_forward(incoming)
+def get_pad_mask(seq, pad_idx):
+	return (seq != pad_idx).unsqueeze(-2)
 
-class EmbeddingLayer(nn.Module):
-	def __init__(self, param):
+
+def get_subsequent_mask(seq):
+	sz_b, len_s = seq.size()
+	return _get_subsequent_mask(len_s, seq.device)
+
+
+def _get_subsequent_mask(len_s, device):
+	subsequent_mask = 1 - torch.triu(
+		torch.ones((1, len_s, len_s), device=device, dtype=torch.uint8), diagonal=1)
+	return subsequent_mask
+
+
+class PositionalEncoding(nn.Module):
+
+	def __init__(self, d_hid, n_position=200):
+		super(PositionalEncoding, self).__init__()
+
+		self.register_buffer('pos_table', self._get_sinusoid_encoding_table(n_position, d_hid))
+
+	def _get_sinusoid_encoding_table(self, n_position, d_hid):
+
+		def get_position_angle_vec(position):
+			return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
+
+		sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+		sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
+		sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
+
+		return torch.FloatTensor(sinusoid_table).unsqueeze(0)
+
+	def forward(self, x):
+		return x + self.pos_table[:, :x.size(1)].clone().detach()
+
+
+class Encoder(nn.Module):
+
+	def __init__(
+			self, n_src_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
+			d_model, d_inner, pad_idx, dropout=0.1, n_position=200):
+
 		super().__init__()
-		self.args = args = param.args
-		self.param = param
-		volatile = param.volatile
 
-		self.embLayer = nn.Embedding(volatile.dm.vocab_size, args.embedding_size)
-		self.embLayer.weight = nn.Parameter(torch.Tensor(volatile.wordvec))
+		self.src_word_emb = nn.Embedding(n_src_vocab, d_word_vec, padding_idx=pad_idx)
+		self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
+		self.dropout = nn.Dropout(p=dropout)
+		self.layer_stack = nn.ModuleList([
+			EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+			for _ in range(n_layers)])
+		self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
 
-	def forward(self, incoming):
-		'''
-		inp: data
-		output: post
-		'''
-		incoming.post = Storage()
-		incoming.post.embedding = self.embLayer(incoming.data.post)
-		incoming.resp = Storage()
-		incoming.resp.embedding = self.embLayer(incoming.data.resp)
-		incoming.resp.embLayer = self.embLayer
+	def forward(self, src_seq, src_mask, return_attns=False):
 
-class PostEncoder(nn.Module):
-	def __init__(self, param):
+		enc_slf_attn_list = []
+
+		# -- Forward
+		
+		enc_output = self.dropout(self.position_enc(self.src_word_emb(src_seq)))
+
+		for enc_layer in self.layer_stack:
+			enc_output, enc_slf_attn = enc_layer(enc_output, slf_attn_mask=src_mask)
+			enc_slf_attn_list += [enc_slf_attn] if return_attns else []
+
+		enc_output = self.layer_norm(enc_output)
+
+		if return_attns:
+			return enc_output, enc_slf_attn_list
+		return enc_output,
+
+
+class Decoder(nn.Module):
+
+	def __init__(
+			self, n_trg_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
+			d_model, d_inner, pad_idx, n_position=200, dropout=0.1):
+
 		super().__init__()
-		self.args = args = param.args
-		self.param = param
 
-		self.postGRU = MyGRU(args.embedding_size, args.eh_size, bidirectional=True)
-		self.drop = nn.Dropout(args.droprate)
-		if self.args.batchnorm:
-			self.seqnorm = SequenceBatchNorm(args.eh_size * 2)
-			self.batchnorm = nn.BatchNorm1d(args.eh_size * 2)
+		self.trg_word_emb = nn.Embedding(n_trg_vocab, d_word_vec, padding_idx=pad_idx)
+		self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
+		self.dropout = nn.Dropout(p=dropout)
+		self.layer_stack = nn.ModuleList([
+			DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+			for _ in range(n_layers)])
+		self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
 
-	def forward(self, incoming):
-		incoming.hidden = hidden = Storage()
-		hidden.h_n, hidden.h = self.postGRU.forward(incoming.post.embedding, incoming.data.post_length, need_h=True)
-		if self.args.batchnorm:
-			hidden.h = self.seqnorm(hidden.h, incoming.data.post_length)
-			hidden.h_n = self.batchnorm(hidden.h_n)
-		hidden.h = self.drop(hidden.h)
-		hidden.h_n = self.drop(hidden.h_n)
+	def forward(self, trg_seq, trg_mask, enc_output, src_mask, return_attns=False):
 
-class ConnectLayer(nn.Module):
-	def __init__(self, param):
+		dec_slf_attn_list, dec_enc_attn_list = [], []
+
+		# -- Forward
+		dec_output = self.dropout(self.position_enc(self.trg_word_emb(trg_seq)))
+
+		for dec_layer in self.layer_stack:
+			dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
+				dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask)
+			dec_slf_attn_list += [dec_slf_attn] if return_attns else []
+			dec_enc_attn_list += [dec_enc_attn] if return_attns else []
+
+		dec_output = self.layer_norm(dec_output)
+
+		if return_attns:
+			return dec_output, dec_slf_attn_list, dec_enc_attn_list
+		return dec_output,
+
+
+class Transformer(nn.Module):
+
+	def __init__(
+			self, n_src_vocab, n_trg_vocab, src_pad_idx, trg_pad_idx,
+			d_word_vec=512, d_model=512, d_inner=2048,
+			n_layers=6, n_head=8, d_k=64, d_v=64, dropout=0.1, n_position=200,
+			trg_emb_prj_weight_sharing=True, emb_src_trg_weight_sharing=True):
+
 		super().__init__()
-		self.args = args = param.args
-		self.param = param
-		self.initLinearLayer = nn.Linear(args.eh_size * 2, args.dh_size)
 
-	def forward(self, incoming):
-		incoming.conn = conn = Storage()
-		conn.init_h = self.initLinearLayer(incoming.hidden.h_n)
+		self.src_pad_idx, self.trg_pad_idx = src_pad_idx, trg_pad_idx
 
-class GenNetwork(nn.Module):
-	def __init__(self, param):
-		super().__init__()
-		self.args = args = param.args
-		self.param = param
+		self.encoder = Encoder(
+			n_src_vocab=n_src_vocab, n_position=n_position,
+			d_word_vec=d_word_vec, d_model=d_model, d_inner=d_inner,
+			n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+			pad_idx=src_pad_idx, dropout=dropout)
 
-		self.GRULayer = SingleAttnGRU(args.embedding_size, args.dh_size, args.eh_size * 2, initpara=False)
-		self.wLinearLayer = nn.Linear(args.dh_size + args.eh_size * 2, param.volatile.dm.vocab_size)
-		self.lossCE = nn.CrossEntropyLoss()
-		self.start_generate_id = param.volatile.dm.go_id
+		self.decoder = Decoder(
+			n_trg_vocab=n_trg_vocab, n_position=n_position,
+			d_word_vec=d_word_vec, d_model=d_model, d_inner=d_inner,
+			n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+			pad_idx=trg_pad_idx, dropout=dropout)
 
-		self.drop = nn.Dropout(args.droprate)
+		self.trg_word_prj = nn.Linear(d_model, n_trg_vocab, bias=False)
 
-	def teacherForcing(self, inp, gen):
-		embedding = inp.embedding
-		length = inp.resp_length
-		embedding = self.drop(embedding)
-		_, gen.h, _ = self.GRULayer.forward(embedding, length-1, inp.post, inp.post_length, h_init=inp.init_h)
-		gen.h = torch.stack(gen.h, dim=0)
-		gen.h = self.drop(gen.h)
-		gen.w = self.wLinearLayer(gen.h)
+		for p in self.parameters():
+			if p.dim() > 1:
+				nn.init.xavier_uniform_(p) 
+
+		# assert d_model == d_word_vec, \
+
+		self.x_logit_scale = 1.
+		if trg_emb_prj_weight_sharing:
+			self.trg_word_prj.weight = self.decoder.trg_word_emb.weight
+			self.x_logit_scale = (d_model ** -0.5)
+
+		if emb_src_trg_weight_sharing:
+			self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
 
 
-	def freerun(self, inp, gen):
-		#mode: beam = beamsearch; max = choose max; sample = random_sampling; sample10 = sample from max 10
+	def forward(self, src_seq, trg_seq):
 
-		def wLinearLayerCallback(gru_h):
-			gru_h = self.drop(gru_h)
-			w = self.wLinearLayer(gru_h)
-			return w
+		src_mask = get_pad_mask(src_seq, self.src_pad_idx)
+		trg_mask = get_pad_mask(trg_seq, self.trg_pad_idx) & get_subsequent_mask(trg_seq)
 
-		def input_callback(i, now):
-			return self.drop(now)
+		enc_output, *_ = self.encoder(src_seq, src_mask)
+		dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask)
+		seq_logit = self.trg_word_prj(dec_output) * self.x_logit_scale
 
-		if self.args.decode_mode == "beam":
-			new_gen = self.GRULayer.beamsearch(inp, self.args.top_k, wLinearLayerCallback, \
-				input_callback=input_callback, no_unk=True, length_penalty=self.args.length_penalty)
-			w_o = []
-			length = []
-			for i in range(inp.batch_size):
-				w_o.append(new_gen.w_o[:, i, 0])
-				length.append(new_gen.length[i][0])
-			gen.w_o = torch.stack(w_o).transpose(0, 1)
-			gen.length = length
-
-		else:
-			new_gen = self.GRULayer.freerun(inp, wLinearLayerCallback, self.args.decode_mode, \
-				input_callback=input_callback, no_unk=True, top_k=self.args.top_k)
-			gen.w_o = new_gen.w_o
-			gen.length = new_gen.length
-
-	def forward(self, incoming):
-		inp = Storage()
-		inp.resp_length = incoming.data.resp_length
-		inp.embedding = incoming.resp.embedding
-		inp.post = incoming.hidden.h
-		inp.post_length = incoming.data.post_length
-		inp.init_h = incoming.conn.init_h
-
-		incoming.gen = gen = Storage()
-		self.teacherForcing(inp, gen)
-
-		w_o_f = flattenSequence(gen.w, incoming.data.resp_length-1)
-		data_f = flattenSequence(incoming.data.resp[1:], incoming.data.resp_length-1)
-		incoming.result.word_loss = self.lossCE(w_o_f, data_f)
-		incoming.result.perplexity = torch.exp(incoming.result.word_loss)
-
-	def detail_forward(self, incoming):
-		inp = Storage()
-		batch_size = inp.batch_size = incoming.data.batch_size
-		inp.init_h = incoming.conn.init_h
-		inp.post = incoming.hidden.h
-		inp.post_length = incoming.data.post_length
-		inp.embLayer = incoming.resp.embLayer
-		inp.dm = self.param.volatile.dm
-		inp.max_sent_length = self.args.max_sent_length
-
-		incoming.gen = gen = Storage()
-		self.freerun(inp, gen)
-
-		dm = self.param.volatile.dm
-		w_o = gen.w_o.detach().cpu().numpy()
-		incoming.result.resp_str = resp_str = \
-				[" ".join(dm.convert_ids_to_tokens(w_o[:, i].tolist())) for i in range(batch_size)]
-		incoming.result.golden_str = golden_str = \
-				[" ".join(dm.convert_ids_to_tokens(incoming.data.resp[:, i].detach().cpu().numpy().tolist()))\
-				for i in range(batch_size)]
-		incoming.result.post_str = post_str = \
-				[" ".join(dm.convert_ids_to_tokens(incoming.data.post[:, i].detach().cpu().numpy().tolist()))\
-				for i in range(batch_size)]
-		incoming.result.show_str = "\n".join(["post: " + a + "\n" + "resp: " + b + "\n" + \
-				"golden: " + c + "\n" \
-				for a, b, c in zip(post_str, resp_str, golden_str)])
+		return seq_logit.view(-1, seq_logit.size(2))
